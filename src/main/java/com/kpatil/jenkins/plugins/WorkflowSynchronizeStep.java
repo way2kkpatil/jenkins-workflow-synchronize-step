@@ -3,15 +3,19 @@ package com.kpatil.jenkins.plugins;
 import java.lang.ref.WeakReference;
 import java.text.DateFormat;
 import java.text.SimpleDateFormat;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Date;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.logging.Logger;
 
 import javax.annotation.Nonnull;
 import javax.inject.Inject;
@@ -32,11 +36,14 @@ import hudson.model.ModelObject;
 import hudson.model.Run;
 import hudson.model.TaskListener;
 import hudson.util.ListBoxModel;
+import jenkins.InitReactorRunner;
 import jenkins.model.Jenkins;
 
 @SuppressWarnings("rawtypes")
 public class WorkflowSynchronizeStep extends AbstractStepImpl {
 
+	private static final Logger LOGGER = Logger.getLogger(WorkflowSynchronizeStep.class.getName());
+	
 	private final String key;
 	private final long timeout;
 	private final TimeUnit unit;
@@ -105,6 +112,51 @@ public class WorkflowSynchronizeStep extends AbstractStepImpl {
 
 		public DescriptorImpl() {
 			super(Execution.class);
+			Executors.newSingleThreadScheduledExecutor().scheduleWithFixedDelay(new Runnable() {
+
+				@Override
+				public void run() {
+					try {
+						final Map<String, LockState> locks = new HashMap<>(getLocks());
+						for (Entry<String, LockState> lock : locks.entrySet()) {
+							final String key = lock.getKey();
+							final LockState state = lock.getValue();
+							if (state != null) {
+								if (state.owner != null) {
+									final Run<?, ?> run = state.owner.get();
+									if (run == null || !run.isBuilding()) {
+										release(key, state, run);
+										LOGGER.info("Released stuck lock : [Key:" + key + "][Owner:" + run + "]");
+									}
+								} else {
+									release(key, state, null);
+								}
+							}
+						}
+					} catch (Exception e) {
+						LOGGER.warning("Failed to check on stuck locks - " + e);
+						e.printStackTrace();
+					}
+				}
+
+				private void release(final String key, final LockState state, final Run<?, ?> run) {
+					try {
+						state.lock.tryLock(1, TimeUnit.SECONDS);
+						try {
+							if (run != null && state.owner.get() == run) {
+								state.owner = null;
+							}
+						} finally {
+							state.availability.signalAll();
+							state.lock.unlock();
+						}
+					} catch (InterruptedException e) {
+						LOGGER.warning("Failed to release lock [Key:" + key + "] - " + e);
+						e.printStackTrace();
+					}
+				}
+
+			}, 0, 1, TimeUnit.MINUTES);
 		}
 
 		@XStreamOmitField
